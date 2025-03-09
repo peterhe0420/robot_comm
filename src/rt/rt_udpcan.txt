@@ -1,0 +1,261 @@
+/*!
+ * @file rt_udpcan.h
+ * @brief Udp-can communication to motor board
+ */
+
+
+#include <byteswap.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "rt/rt_udpcan.h"
+#include <lcm/lcm-cpp.hpp>
+
+int udpcan_open();
+
+static motor_cmd_t g_motor_cmd;
+static motor_data_t g_motor_data;
+
+spi_command_t udpcan_command_drv;
+spi_data_t udpcan_data_drv;
+spi_torque_t udpcan_torque;
+
+pthread_mutex_t udpcan_mutex = PTHREAD_MUTEX_INITIALIZER;
+//spinor
+static MotorMgmt motorMgmt;
+
+const float max_torque[3] = {17.f, 17.f, 26.f};  // TODO CHECK WITH BEN
+const float wimp_torque[3] = {6.f, 6.f, 6.f};    // TODO CHECK WITH BEN
+const float disabled_torque[3] = {0.f, 0.f, 0.f};
+
+// only used for actual robot
+const float abad_side_sign[4] = {-1.f, -1.f, 1.f, 1.f};
+const float hip_side_sign[4] = {-1.f, 1.f, -1.f, 1.f};
+const float knee_side_sign[4] = {-.6429f, .6429f, -.6429f, .6429f};
+
+// only used for actual robot
+const float abad_offset[4] = {0.f, 0.f, 0.f, 0.f};
+const float hip_offset[4] = {M_PI / 2.f, -M_PI / 2.f, -M_PI / 2.f, M_PI / 2.f};
+const float knee_offset[4] = {K_KNEE_OFFSET_POS, -K_KNEE_OFFSET_POS,
+                              -K_KNEE_OFFSET_POS, K_KNEE_OFFSET_POS};
+
+static int callme(MotorParamGet param, MotorPosition pos, MotorType type, void* contex) {
+    static int mask = 0;
+    if(pos < MotorPos_FrontLeft || pos >= MotorPos_MAX) return -1;
+    if(type < MotorType_ANode || type >= MotorType_MAX) return -1;
+    mask |= 1 << (MotorType_MAX * pos + type);
+    LDEBUG(LDEBUG_NOTICE, "%02X pos: %d type: %d p: %f v: %f t: %f\n", mask, pos, type, param.pos, param.vel, param.torque);
+    switch(type) {
+        case MotorType_ANode: 
+            g_motor_data.q_abad[pos] = param.pos;
+            g_motor_data.qd_abad[pos] = param.vel;
+            g_motor_data.tau_abad[pos] = param.torque;
+            break;
+        case MotorType_HNode: 
+            g_motor_data.q_hip[pos] = param.pos;
+            g_motor_data.qd_hip[pos] = param.vel;
+            g_motor_data.tau_hip[pos] = param.torque;
+            break;
+        case MotorType_KNode: 
+            g_motor_data.q_knee[pos] = param.pos;
+            g_motor_data.qd_knee[pos] = param.vel;
+            g_motor_data.tau_knee[pos] = param.torque;
+            break;
+        default:
+            break;
+    }
+    
+    return 0;
+}
+
+/*!
+ * Emulate the udpcan board to estimate the torque.
+ */
+void fake_motor_control(spi_command_t *cmd, spi_data_t *data,
+                        spi_torque_t *torque_out, int board_num) {
+  torque_out->tau_knee[board_num] =
+      cmd->kp_knee[board_num] *
+          (cmd->q_des_knee[board_num] - data->q_knee[board_num]) +
+      cmd->kd_knee[board_num] *
+          (cmd->qd_des_knee[board_num] - data->qd_knee[board_num]) +
+      cmd->tau_knee_ff[board_num];
+
+  const float *torque_limits = disabled_torque;
+
+  if (cmd->flags[board_num] & 0b1) {
+    if (cmd->flags[board_num] & 0b10)
+      torque_limits = wimp_torque;
+    else
+      torque_limits = max_torque;
+  }
+
+  if (torque_out->tau_knee[board_num] > torque_limits[2])
+    torque_out->tau_knee[board_num] = torque_limits[2];
+  if (torque_out->tau_knee[board_num] < -torque_limits[2])
+    torque_out->tau_knee[board_num] = -torque_limits[2];
+}
+
+/*!
+ * Initialize UDP-CAN
+ */
+void init_udpcan() {
+  // check sizes:
+  size_t command_size = sizeof(spi_command_t);
+  size_t data_size = sizeof(spi_data_t);
+
+  memset(&udpcan_command_drv, 0, sizeof(udpcan_command_drv));
+  memset(&udpcan_data_drv, 0, sizeof(udpcan_data_drv));
+
+  if (pthread_mutex_init(&udpcan_mutex, NULL) != 0)
+    printf("[ERROR: RT UDP-CAN] Failed to create udpcan data mutex\n");
+
+  if (command_size != K_EXPECTED_COMMAND_SIZE) {
+    printf("[RT UDP-CAN] Error command size is %ld, expected %d\n", command_size,
+           K_EXPECTED_COMMAND_SIZE);
+  } else
+    printf("[RT UDP-CAN] command size good\n");
+
+  if (data_size != K_EXPECTED_DATA_SIZE) {
+    printf("[RT UDP-CAN] Error data size is %ld, expected %d\n", data_size,
+           K_EXPECTED_DATA_SIZE);
+  } else
+    printf("[RT UDP-CAN] data size good\n");
+
+  printf("[RT UDP-CAN] Open\n");
+  udpcan_open();
+}
+
+/*!
+ * Open UDP-CAN device
+ */
+int udpcan_open() {
+    int rv = 0;
+  
+    if(LERRCODE_OK != motorMgmt.initConn()) {
+        LDEBUG(LDEBUG_ERR, "UDP communication init failed!\n");
+        return -1;
+    }
+    motorMgmt.initMotor();
+    motorMgmt.regCallback(callme, nullptr);
+
+    return rv;
+}
+
+int udpcan_driver_iterations = 0;
+
+/*!
+ * convert udpcan command to motor_cmd_t
+ */
+void udpcan_to_motor(spi_command_t *cmd, motor_cmd_t *motor_cmd, int pos) {
+    motor_cmd->q_des_abad[pos] = (cmd->q_des_abad[pos] * abad_side_sign[pos]) + abad_offset[pos];
+    motor_cmd->q_des_hip[pos] = (cmd->q_des_hip[pos] * hip_side_sign[pos]) + hip_offset[pos];
+    motor_cmd->q_des_knee[pos] = (cmd->q_des_knee[pos] / knee_side_sign[pos]) + knee_offset[pos];
+
+    motor_cmd->qd_des_abad[pos] = cmd->qd_des_abad[pos] * abad_side_sign[pos];
+    motor_cmd->qd_des_hip[pos] = cmd->qd_des_hip[pos] * hip_side_sign[pos];
+    motor_cmd->qd_des_knee[pos] = cmd->qd_des_knee[pos] / knee_side_sign[pos];
+
+    motor_cmd->kp_abad[pos] = cmd->kp_abad[pos];
+    motor_cmd->kp_hip[pos] = cmd->kp_hip[pos];
+    motor_cmd->kp_knee[pos] = cmd->kp_knee[pos];
+
+    motor_cmd->kd_abad[pos] = cmd->kd_abad[pos];
+    motor_cmd->kd_hip[pos] = cmd->kd_hip[pos];
+    motor_cmd->kd_knee[pos] = cmd->kd_knee[pos];
+
+    motor_cmd->tau_abad_ff[pos] = cmd->tau_abad_ff[pos] * abad_side_sign[pos];
+    motor_cmd->tau_hip_ff[pos] = cmd->tau_hip_ff[pos] * hip_side_sign[pos];
+    motor_cmd->tau_knee_ff[pos] = udpcan_torque.tau_knee[pos] * knee_side_sign[pos];
+
+    motor_cmd->flags[pos] = cmd->flags[pos];
+}
+
+/*!
+ * convert motor_data_t to udpcan data
+ */
+void motor_to_udpcan(spi_data_t *data, motor_data_t *motor_data, int pos) {
+  data->q_abad[pos] = (motor_data->q_abad[pos] - abad_offset[pos]) * abad_side_sign[pos];
+  data->q_hip[pos] = (motor_data->q_hip[pos] - hip_offset[pos]) * hip_side_sign[pos];
+  data->q_knee[pos] = (motor_data->q_knee[pos] - knee_offset[pos]) * knee_side_sign[pos];
+
+  data->qd_abad[pos] = motor_data->qd_abad[pos] * abad_side_sign[pos];
+  data->qd_hip[pos] = motor_data->qd_hip[pos] * hip_side_sign[pos];
+  data->qd_knee[pos] = motor_data->qd_knee[pos] * knee_side_sign[pos];
+
+  data->tau_abad[pos] = motor_data->tau_abad[pos] * abad_side_sign[pos];
+  data->tau_hip[pos] = motor_data->tau_hip[pos] * hip_side_sign[pos];
+  data->tau_knee[pos] = motor_data->tau_knee[pos] * knee_side_sign[pos];
+
+  data->flags[pos] = motor_data->flags[pos];
+}
+
+/*!
+ * send receive data and command from motor
+ */
+void udpcan_send_receive(spi_command_t *command, spi_data_t *data) {
+  // update driver status flag
+  udpcan_driver_iterations++;
+  data->spi_driver_status = udpcan_driver_iterations << 16;
+
+  // Message send
+  MotorParamSet param;
+  for(int pos = MotorPos_FrontLeft; pos < MotorPos_MAX; ++pos) {
+    // copy command into motor type:
+    udpcan_to_motor(command, &g_motor_cmd, pos);
+
+    param.pos = g_motor_cmd.q_des_abad[pos];
+    param.vel = g_motor_cmd.qd_des_abad[pos];
+    param.kp = g_motor_cmd.kp_abad[pos];
+    param.kd = g_motor_cmd.kd_abad[pos];
+    param.torque = g_motor_cmd.tau_abad_ff[pos];
+    motorMgmt.setMotorPara((MotorPosition)pos, MotorType_ANode, param);
+
+    param.pos = g_motor_cmd.q_des_hip[pos];
+    param.vel = g_motor_cmd.qd_des_hip[pos];
+    param.kp = g_motor_cmd.kp_hip[pos];
+    param.kd = g_motor_cmd.kd_hip[pos];
+    param.torque = g_motor_cmd.tau_hip_ff[pos];
+    motorMgmt.setMotorPara((MotorPosition)pos, MotorType_HNode, param);
+
+    param.pos = g_motor_cmd.q_des_knee[pos];
+    param.vel = g_motor_cmd.qd_des_knee[pos];
+    param.kp = g_motor_cmd.kp_knee[pos];
+    param.kd = g_motor_cmd.kd_knee[pos];
+    param.torque = udpcan_torque.tau_knee[pos];
+    motorMgmt.setMotorPara((MotorPosition)pos, MotorType_KNode, param);
+    
+    // copy back to data
+    motor_to_udpcan(data, &g_motor_data, pos);
+  }
+}
+
+/*!
+ * Run UDP-CAN
+ */
+void udpcan_driver_run() {
+  // do udpcan board calculations
+  for (int i = 0; i < 4; i++) {
+    fake_motor_control(&udpcan_command_drv, &udpcan_data_drv, &udpcan_torque, i);
+  }
+
+  // in here, the driver is good
+  pthread_mutex_lock(&udpcan_mutex);
+  udpcan_send_receive(&udpcan_command_drv, &udpcan_data_drv);
+  pthread_mutex_unlock(&udpcan_mutex);
+}
+
+/*!
+ * Get the udpcan command
+ */
+spi_command_t *get_udpcan_command() {
+  return &udpcan_command_drv;
+}
+
+/*!
+ * Get the udpcan data
+ */
+spi_data_t *get_udpcan_data() { return &udpcan_data_drv; }
+
+
